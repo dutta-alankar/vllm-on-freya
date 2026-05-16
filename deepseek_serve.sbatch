@@ -18,13 +18,16 @@
 #
 # Model: /u/adutt/ptmp/vllm/models/DeepSeek-V4-Pro  (~806 GB on disk, FP8)
 # Resources: 4 nodes × 4 A100-80GB = 16 GPUs × 80 GB = 1280 GB VRAM
-#   - FP8 weights: ~671 GB
-#   - Remaining for KV cache + activations: ~550 GB
-#   - MLA KV cache is very compact, supports large context windows
 #
-# Max settings:
-#   TP=16 across 4 nodes, gpu-memory-utilization=0.95, max-model-len=131072,
-#   prefix caching enabled, FP8 weights loaded natively via config.json.
+# Why PP=2 + TP=8 (not TP=16):
+#   DeepSeek-V4-Pro has moe_intermediate_size=3072. The always-active shared
+#   expert's down_proj is a RowParallelLinear with input_size=3072. The FP8
+#   block quantization (block_k=128) requires input_size_per_partition % 128 == 0.
+#   With TP=16: 3072/16=192, 192%128=64 ≠ 0 → vLLM raises ValueError.
+#   With TP=8:  3072/8 =384, 384%128=0  ✓ → passes.
+#   But TP=8 on 8 GPUs (640 GB total) can't fit ~806 GB of weights.
+#   Solution: PP=2 × TP=8 = 16 GPUs total; each pipeline stage holds half
+#   the layers (~403 GB) across 8 GPUs → ~50 GB/GPU for weights ✓.
 #
 # Override at submit time:
 #   VLLM_PORT=8010 sbatch deepseek_serve.sbatch
@@ -43,9 +46,11 @@ MODEL=${MODEL:-/u/adutt/ptmp/vllm/models/DeepSeek-V4-Pro}
 RAY_PORT=6379
 VLLM_PORT=${VLLM_PORT:-8000}
 GPUS_PER_NODE=${GPUS_PER_NODE:-4}
-# TP = total GPUs across all nodes. With Ray as the distributed backend, vLLM
-# spreads TP workers evenly across nodes — 4 GPUs/node × 4 nodes = 16 GPUs.
-TENSOR_PARALLEL_SIZE=$((SLURM_NNODES * GPUS_PER_NODE))
+# TP=8 is fixed: the FP8 block alignment constraint (block_k=128) requires
+# moe_intermediate_size/TP to be a multiple of 128. 3072/8=384, 384%128=0 ✓.
+# PP=2 supplies the remaining 8 GPUs needed to fit the full model in VRAM.
+TENSOR_PARALLEL_SIZE=8
+PIPELINE_PARALLEL_SIZE=2
 HEAD_ADDRESS_FILE=/u/adutt/ptmp/vllm/ray_head_address.txt
 # Limit Ray plasma store to 4 GB — vLLM passes tensors via NCCL, not the object store
 RAY_OBJECT_STORE_MEMORY=4294967296
@@ -60,13 +65,13 @@ HEAD_IP=$(hostname --ip-address)
 echo "$(date): DeepSeek-V4-Pro serve job ${SLURM_JOB_ID} starting"
 echo "  Nodes (${SLURM_NNODES}): $(scontrol show hostnames "${SLURM_JOB_NODELIST}" | tr '\n' ' ')"
 echo "  Head: $(hostname) (${HEAD_IP})"
-echo "  TP size:  ${TENSOR_PARALLEL_SIZE}  (${SLURM_NNODES} nodes × ${GPUS_PER_NODE} GPUs, via TCP)"
+echo "  TP size:  ${TENSOR_PARALLEL_SIZE}  PP size: ${PIPELINE_PARALLEL_SIZE}  (${SLURM_NNODES} nodes × ${GPUS_PER_NODE} GPUs)"
 echo "  Model:    ${MODEL}"
 echo "  API port: ${VLLM_PORT}"
 echo ""
 
 # Export so srun tasks inherit these values
-export VENV RAY_PORT GPUS_PER_NODE TENSOR_PARALLEL_SIZE RAY_OBJECT_STORE_MEMORY HEAD_IP
+export VENV RAY_PORT GPUS_PER_NODE TENSOR_PARALLEL_SIZE PIPELINE_PARALLEL_SIZE RAY_OBJECT_STORE_MEMORY HEAD_IP
 # Allow Ray to spill to /tmp if /dev/shm is constrained on shared nodes
 export RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE=1
 
@@ -156,8 +161,9 @@ try:
     gpus = int(res.get("GPU", 0))
     nodes = sum(1 for n in ray.nodes() if n.get("Alive", False))
     print(f"  Ray cluster: {nodes} node(s), {gpus} GPU(s) total")
-    if gpus < ${TENSOR_PARALLEL_SIZE}:
-        print(f"  WARNING: need ${TENSOR_PARALLEL_SIZE} GPUs for TP=${TENSOR_PARALLEL_SIZE}, only {gpus} available")
+    need = ${TENSOR_PARALLEL_SIZE} * ${PIPELINE_PARALLEL_SIZE}
+    if gpus < need:
+        print(f"  WARNING: need {need} GPUs (TP=${TENSOR_PARALLEL_SIZE}×PP=${PIPELINE_PARALLEL_SIZE}), only {gpus} available")
     ray.shutdown()
 except Exception as e:
     print(f"  Ray status check failed: {e}", file=sys.stderr)
@@ -175,10 +181,11 @@ EOF
 #   - 384 routed MoE experts; --trust-remote-code required for DeepseekV4
 #     architecture class not yet in the upstream transformers release.
 #   - No multimodal encoder, so --mm-encoder-tp-mode is omitted.
-echo "$(date): Starting vLLM server (TP=${TENSOR_PARALLEL_SIZE}) on port ${VLLM_PORT}"
+echo "$(date): Starting vLLM server (TP=${TENSOR_PARALLEL_SIZE}, PP=${PIPELINE_PARALLEL_SIZE}) on port ${VLLM_PORT}"
 RAY_ADDRESS="${HEAD_IP}:${RAY_PORT}" \
 vllm serve "${MODEL}" \
     --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \
+    --pipeline-parallel-size "${PIPELINE_PARALLEL_SIZE}" \
     --host 0.0.0.0 \
     --port "${VLLM_PORT}" \
     --served-model-name "$(basename "${MODEL}")" \
@@ -191,7 +198,7 @@ vllm serve "${MODEL}" \
     --trust-remote-code \
     --max-num-seqs 1024 \
     --enable-prefix-caching \
-    --max-model-len 131072 &
+    --max-model-len 65536 &
 VLLM_PID=$!
 
 wait "${VLLM_PID}"
