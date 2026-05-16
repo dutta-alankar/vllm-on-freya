@@ -33,7 +33,10 @@
 # Run from login node:  VLLM_PORT=<port> sbatch scripts/deepseek_serve.sbatch
 # Stop:                 scancel <JOB_ID>
 
-module purge && module load cuda/13.0
+# gcc/14 is required at runtime because DeepGEMM JIT-compiles CUDA kernels
+# via nvcc, which uses gcc as its host compiler. cuda/13.0 sets CUDA_HOME
+# (needed by deep_gemm's assert at import time).
+module purge && module load gcc/14 cuda/13.0
 
 VENV=/u/adutt/ptmp/vllm/.venv
 MODEL=${MODEL:-/u/adutt/ptmp/vllm/models/DeepSeek-V4-Pro}
@@ -66,6 +69,24 @@ echo ""
 export VENV RAY_PORT GPUS_PER_NODE TENSOR_PARALLEL_SIZE RAY_OBJECT_STORE_MEMORY HEAD_IP
 # Allow Ray to spill to /tmp if /dev/shm is constrained on shared nodes
 export RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE=1
+
+# ── DeepGEMM: optimised FP8 block-GEMM kernels for DeepSeek-V4-Pro ─────────
+# Both flags default to 1 when deep_gemm is installed, but we set them
+# explicitly so their effect is visible in the job log.
+#
+# VLLM_USE_DEEP_GEMM      – enables DeepGEMM for attention/linear FP8 layers
+# VLLM_MOE_USE_DEEP_GEMM  – enables DeepGEMM for the 384 MoE expert GEMM ops
+#                           (the dominant compute cost in DeepSeek-V4-Pro)
+# VLLM_USE_DEEP_GEMM_E8M0 – uses UE8M0 per-block scales, matching DeepSeek's
+#                           quantization config (scale_fmt: ue8m0)
+#
+# VLLM_CACHE_ROOT: persistent cache for JIT-compiled kernels across jobs
+export VLLM_USE_DEEP_GEMM=1
+export VLLM_MOE_USE_DEEP_GEMM=1
+export VLLM_USE_DEEP_GEMM_E8M0=1
+export VLLM_CACHE_ROOT=/u/adutt/ptmp/vllm/.vllm_cache
+mkdir -p "${VLLM_CACHE_ROOT}"
+
 # NCCL: exclude loopback so cross-node collective ops use the real network
 export NCCL_SOCKET_IFNAME=^lo,^docker0
 export NCCL_DEBUG=WARN
@@ -88,7 +109,7 @@ trap cleanup EXIT TERM INT
 # ── Step 1: Start Ray daemons on every node via srun (background) ──────────
 # srun keeps each node's SLURM allocation alive; Ray runs as a daemon.
 srun --ntasks="${SLURM_NNODES}" --ntasks-per-node=1 bash -c '
-    module purge && module load cuda/13.0 2>/dev/null || true
+    module purge && module load gcc/14 cuda/13.0 2>/dev/null || true
     source "${VENV}/bin/activate"
     export RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE=1
 
