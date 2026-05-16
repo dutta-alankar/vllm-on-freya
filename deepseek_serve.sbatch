@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -J deepseek_serve
 #SBATCH --partition=p.gpu.ampere
-#SBATCH --nodes=4
+#SBATCH --nodes=6
 #SBATCH --ntasks-per-node=1
 #SBATCH --constrain=gpu
 #SBATCH --gres=gpu:a100:4
@@ -17,21 +17,23 @@
 #   main  → runs vLLM serve directly on the head node (foreground)
 #
 # Model: /u/adutt/ptmp/vllm/models/DeepSeek-V4-Pro  (~806 GB on disk, FP8)
-# Resources: 4 nodes × 4 A100-80GB = 16 GPUs × 80 GB = 1280 GB VRAM
+# Resources: 6 nodes × 4 A100-40GB = 24 GPUs × 40 GB = 960 GB VRAM
 #
-# Why PP=2 + TP=8 (not TP=16):
+# Why PP=3 + TP=8 (not TP=16, not PP=2):
 #   DeepSeek-V4-Pro has moe_intermediate_size=3072. The always-active shared
 #   expert's down_proj is a RowParallelLinear with input_size=3072. The FP8
 #   block quantization (block_k=128) requires input_size_per_partition % 128 == 0.
 #   With TP=16: 3072/16=192, 192%128=64 ≠ 0 → vLLM raises ValueError.
 #   With TP=8:  3072/8 =384, 384%128=0  ✓ → passes.
-#   But TP=8 on 8 GPUs (640 GB total) can't fit ~806 GB of weights.
-#   Solution: PP=2 × TP=8 = 16 GPUs total; each pipeline stage holds half
-#   the layers (~403 GB) across 8 GPUs → ~50 GB/GPU for weights ✓.
+#   But TP=8 alone on 8 GPUs (320 GB) can't fit ~806 GB of weights.
+#   PP=2+TP=8 = 16 × 40GB = 640 GB — still insufficient (OOM at model init).
+#   PP=3+TP=8 = 24 × 40GB = 960 GB; each stage ~20 layers across 8 GPUs
+#   → ~33.6 GB/GPU for weights (fits in 40 GB with room for KV cache) ✓.
+#   MLA KV cache is ~10× smaller than standard MHA, so KV overhead is minimal.
 #
 # Override at submit time:
 #   VLLM_PORT=8010 sbatch deepseek_serve.sbatch
-#   sbatch --nodes=4 --export=ALL,GPUS_PER_NODE=4 deepseek_serve.sbatch
+#   sbatch --nodes=6 --export=ALL,GPUS_PER_NODE=4 deepseek_serve.sbatch
 #
 # Run from login node:  VLLM_PORT=<port> sbatch scripts/deepseek_serve.sbatch
 # Stop:                 scancel <JOB_ID>
@@ -48,9 +50,10 @@ VLLM_PORT=${VLLM_PORT:-8000}
 GPUS_PER_NODE=${GPUS_PER_NODE:-4}
 # TP=8 is fixed: the FP8 block alignment constraint (block_k=128) requires
 # moe_intermediate_size/TP to be a multiple of 128. 3072/8=384, 384%128=0 ✓.
-# PP=2 supplies the remaining 8 GPUs needed to fit the full model in VRAM.
+# PP=3 supplies the remaining 16 GPUs needed to fit the full model in VRAM.
+# (PP=2+TP=8 = 16 × 40GB = 640GB < 806GB model; PP=3+TP=8 = 24 × 40GB = 960GB ✓)
 TENSOR_PARALLEL_SIZE=8
-PIPELINE_PARALLEL_SIZE=2
+PIPELINE_PARALLEL_SIZE=3
 HEAD_ADDRESS_FILE=/u/adutt/ptmp/vllm/ray_head_address.txt
 # Limit Ray plasma store to 4 GB — vLLM passes tensors via NCCL, not the object store
 RAY_OBJECT_STORE_MEMORY=4294967296
@@ -189,7 +192,7 @@ vllm serve "${MODEL}" \
     --tool-call-parser hermes \
     --dtype bfloat16 \
     --kv-cache-dtype fp8_e4m3 \
-    --gpu-memory-utilization 0.95 \
+    --gpu-memory-utilization 0.90 \
     --trust-remote-code \
     --max-num-seqs 1024 \
     --enable-prefix-caching \
