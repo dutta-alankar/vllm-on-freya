@@ -75,20 +75,15 @@ export VENV RAY_PORT GPUS_PER_NODE TENSOR_PARALLEL_SIZE PIPELINE_PARALLEL_SIZE R
 # Allow Ray to spill to /tmp if /dev/shm is constrained on shared nodes
 export RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE=1
 
-# ── DeepGEMM: optimised FP8 block-GEMM kernels for DeepSeek-V4-Pro ─────────
-# Both flags default to 1 when deep_gemm is installed, but we set them
-# explicitly so their effect is visible in the job log.
-#
-# VLLM_USE_DEEP_GEMM      – enables DeepGEMM for attention/linear FP8 layers
-# VLLM_MOE_USE_DEEP_GEMM  – enables DeepGEMM for the 384 MoE expert GEMM ops
-#                           (the dominant compute cost in DeepSeek-V4-Pro)
-# VLLM_USE_DEEP_GEMM_E8M0 – uses UE8M0 per-block scales, matching DeepSeek's
-#                           quantization config (scale_fmt: ue8m0)
-#
-# VLLM_CACHE_ROOT: persistent cache for JIT-compiled kernels across jobs
-export VLLM_USE_DEEP_GEMM=1
-export VLLM_MOE_USE_DEEP_GEMM=1
-export VLLM_USE_DEEP_GEMM_E8M0=1
+# ── DeepGEMM: NOT supported on A100 (Ampere/sm_80) ─────────────────────────
+# DeepGEMM only supports Hopper (H100) and Blackwell (B200) GPUs.
+# Freya A100s are sm_80 (Ampere), so we must disable these env vars.
+# Leaving them enabled causes: ValueError: FP8 MoE backend DEEPGEMM does not
+# support the deployment configuration since kernel does not support current
+# device cuda.  vLLM will fall back to the vllm_cutlass FP8 MoE backend.
+export VLLM_USE_DEEP_GEMM=0
+export VLLM_MOE_USE_DEEP_GEMM=0
+export VLLM_USE_DEEP_GEMM_E8M0=0
 export VLLM_CACHE_ROOT=/u/adutt/ptmp/vllm/.vllm_cache
 mkdir -p "${VLLM_CACHE_ROOT}"
 
