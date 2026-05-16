@@ -186,6 +186,7 @@ vllm serve "${MODEL}" \
     --enable-auto-tool-choice \
     --tool-call-parser hermes \
     --dtype bfloat16 \
+    --kv-cache-dtype fp8_e4m3 \
     --gpu-memory-utilization 0.95 \
     --trust-remote-code \
     --max-num-seqs 1024 \
